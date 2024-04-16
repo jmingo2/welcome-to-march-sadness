@@ -1,0 +1,951 @@
+---
+title: "Welcome to March Sadness: Using Turnovers Per Possession to Predict the 2024 NCAA Tournament"
+author: "Jay Mingo"
+date: '2024-04-04'
+categories: [ncaa, basketball, data]
+image: "image.png"
+format: 
+  html:
+    code-fold: true
+---
+
+One day, the pain will eventually subside. Today, however, isn't the day.
+
+Ahead of the start of March Madness, I looked at my bracket with excitement. It was the first time that I'd ever used code or anything other than my gut to fill out a bracket of any kind, but this one seemed reliable. Computers know more than I do, right?
+
+Wrong. Kind of?
+
+My bracket had some highs, like predicting Oakland or Saint Mary's to win. Conversely, it had plenty of lows, like predicting Vermont to make it to the National Championship game before barely losing to UConn.
+
+Terrible, horrible, disgusting, repugnant, and the list of words continues. Thanks thesaurus!
+
+It's March Madness. The unexpected will happen and it will happen often and in the most heartbreaking ways. I knew this already, but how did I end up with UConn and Vermont as the last two standing? Where did I go wrong?
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(hoopR)
+library(gt)
+
+set.seed(1234)
+
+games <- load_mbb_team_box(seasons = 2015:2024)
+
+nond1 <- games |> group_by(team_id, season) |> tally() |> filter(n < 10 & season != 2021) |> select(team_id)
+nond1 <- pull(nond1)
+
+df <- games |> filter(!team_id %in% nond1 & !opponent_team_id %in% nond1) |> filter(game_date < as.Date("2024-03-18"))
+
+teamside <- df |> 
+  group_by(team_short_display_name, season) |> 
+  arrange(game_date) |> 
+  mutate(
+    team_possessions = field_goals_attempted - offensive_rebounds + turnovers + (.475 * free_throws_attempted),
+    team_points_per_possession = team_score/team_possessions,
+    team_defensive_points_per_possession = opponent_team_score/team_possessions,
+    team_offensive_efficiency = team_points_per_possession * 100,
+    team_defensive_efficiency = team_defensive_points_per_possession * 100,
+    team_season_offensive_efficiency = lag(cummean(team_offensive_efficiency), n=1),
+    team_season_defensive_efficiency = lag(cummean(team_defensive_efficiency), n=1),  
+    turnovers_per_possession = total_turnovers/team_possessions, 
+    team_turnovers_per_possession = lag(cummean(turnovers_per_possession), n=1),
+    score_margin = team_score - opponent_team_score,
+    absolute_score_margin = abs(score_margin)
+  ) |> 
+  filter(absolute_score_margin <= 40) |> 
+  ungroup()
+
+opponentside <- teamside |> 
+  select(-opponent_team_id) |> 
+  rename(
+    opponent_team_id = team_id,
+    opponent_season_offensive_efficiency = team_season_offensive_efficiency,
+    opponent_season_defensive_efficiency = team_season_defensive_efficiency,
+    opponent_turnovers_per_possession = team_turnovers_per_possession
+  ) |> 
+  select(
+    game_id,
+    opponent_team_id,
+    opponent_season_offensive_efficiency,
+    opponent_season_defensive_efficiency, 
+    opponent_turnovers_per_possession
+  )
+
+bothsides <- teamside |> inner_join(opponentside)
+
+bothsides <- bothsides |> mutate(
+  team_result = as.factor(case_when(
+    team_score > opponent_team_score ~ "W",
+    opponent_team_score > team_score ~ "L"
+)))
+
+bothsides$team_result <- relevel(bothsides$team_result, ref="W")
+
+modelgames <- bothsides |> 
+  select(
+    game_id, 
+    game_date, 
+    team_short_display_name, 
+    opponent_team_short_display_name, 
+    season, 
+    team_season_offensive_efficiency,
+    team_season_defensive_efficiency,
+    opponent_season_offensive_efficiency,
+    opponent_season_defensive_efficiency,
+    team_turnovers_per_possession,
+    opponent_turnovers_per_possession,
+    team_result
+    ) |> 
+  na.omit()
+
+game_split <- initial_split(modelgames, prop = .8)
+game_train <- training(game_split)
+game_test <- testing(game_split)
+
+game_recipe <- 
+  recipe(team_result ~ ., data = game_split) |> 
+  update_role(game_id, game_date, team_short_display_name, opponent_team_short_display_name, season, new_role = "ID") |>
+  step_normalize(all_predictors())
+
+summary(game_recipe)
+
+log_mod <- 
+  logistic_reg() |> 
+  set_engine("glm") |>
+  set_mode("classification")
+
+rf_mod <- 
+  rand_forest() |> 
+  set_engine("ranger") |>
+  set_mode("classification")
+
+log_workflow <- 
+  workflow() |> 
+  add_model(log_mod) |> 
+  add_recipe(game_recipe)
+
+rf_workflow <- 
+  workflow() |> 
+  add_model(rf_mod) |> 
+  add_recipe(game_recipe)
+
+log_fit <- 
+  log_workflow |> 
+  fit(data = game_train)
+
+rf_fit <- 
+  rf_workflow |> 
+  fit(data = game_train)
+
+logpredict <- log_fit |> predict(new_data = game_train) |>
+  bind_cols(game_train) 
+
+logpredict <- log_fit |> predict(new_data = game_train, type="prob") |>
+  bind_cols(logpredict)
+
+rfpredict <- rf_fit |> predict(new_data = game_train) |>
+  bind_cols(game_train) 
+
+rfpredict <- rf_fit |> predict(new_data = game_train, type="prob") |>
+  bind_cols(rfpredict)
+
+metrics(logpredict, team_result, .pred_class)
+
+metrics(rfpredict, team_result, .pred_class)
+
+teamside <- df |> 
+  group_by(team_short_display_name, season) |> 
+  arrange(game_date) |> 
+  mutate(
+    team_possessions = field_goals_attempted - offensive_rebounds + turnovers + (.475 * free_throws_attempted),
+    team_points_per_possession = team_score/team_possessions,
+    team_defensive_points_per_possession = opponent_team_score/team_possessions,
+    team_offensive_efficiency = team_points_per_possession * 100,
+    team_defensive_efficiency = team_defensive_points_per_possession * 100,
+    team_season_offensive_efficiency = cummean(team_offensive_efficiency),
+    team_season_defensive_efficiency = cummean(team_defensive_efficiency),  
+    team_turnovers_per_possession = total_turnovers/team_possessions,
+    cummean(team_turnovers_per_possession),
+    score_margin = team_score - opponent_team_score,
+    absolute_score_margin = abs(score_margin)
+  ) |> 
+  filter(absolute_score_margin <= 40) |> 
+  ungroup()
+
+opponentside <- teamside |> 
+  select(-opponent_team_id) |> 
+  rename(
+    opponent_team_id = team_id,
+    opponent_season_offensive_efficiency = team_season_offensive_efficiency,
+    opponent_season_defensive_efficiency = team_season_defensive_efficiency,
+    opponent_turnovers_per_possession = team_turnovers_per_possession
+  ) |> 
+  select(
+    game_id,
+    opponent_team_id,
+    opponent_season_offensive_efficiency,
+    opponent_season_defensive_efficiency, 
+    opponent_turnovers_per_possession
+  )
+
+bothsides <- teamside |> inner_join(opponentside)
+
+bothsides <- bothsides |> mutate(
+  team_result = as.factor(case_when(
+    team_score > opponent_team_score ~ "W",
+    opponent_team_score > team_score ~ "L"
+)))
+
+bothsides$team_result <- relevel(bothsides$team_result, ref="W")
+
+modelgames <- bothsides |> 
+  select(
+    game_id, 
+    game_date, 
+    team_short_display_name, 
+    opponent_team_short_display_name, 
+    season, 
+    team_season_offensive_efficiency,
+    team_season_defensive_efficiency,
+    opponent_season_offensive_efficiency,
+    opponent_season_defensive_efficiency,
+    team_turnovers_per_possession,
+    opponent_turnovers_per_possession,
+    team_result
+    ) |> 
+  na.omit()
+
+logtestpredict <- log_fit |> predict(new_data = game_test) |>
+  bind_cols(game_test)
+
+logtestpredict <- log_fit |> predict(new_data = game_test, type="prob") |>
+  bind_cols(logtestpredict)
+
+metrics(logtestpredict, team_result, .pred_class)
+
+rftestpredict <- rf_fit |> predict(new_data = game_test) |>
+  bind_cols(game_test)
+
+rftestpredict <- rf_fit |> predict(new_data = game_test, type="prob") |>
+  bind_cols(rftestpredict)
+
+metrics(rftestpredict, team_result, .pred_class)
+
+logtestpredict |>
+  conf_mat(team_result, .pred_class)
+
+rftestpredict |>
+  conf_mat(team_result, .pred_class)
+
+eastround1games <- tibble(
+  team_short_display_name="UConn",
+  opponent_team_short_display_name="Stetson"
+) |> add_row(
+  team_short_display_name="FAU",
+  opponent_team_short_display_name="Northwestern"
+) |> add_row(
+  team_short_display_name="San Diego St",
+  opponent_team_short_display_name="UAB"
+) |> add_row(
+  team_short_display_name="Auburn",
+  opponent_team_short_display_name="Yale"
+) |> add_row(
+  team_short_display_name="BYU",
+  opponent_team_short_display_name="Duquesne"
+) |> add_row(
+  team_short_display_name="Illinois",
+  opponent_team_short_display_name="Morehead St"
+) |> add_row(
+  team_short_display_name="Washington St",
+  opponent_team_short_display_name="Drake"
+) |> add_row(
+  team_short_display_name="Iowa State",
+  opponent_team_short_display_name="S Dakota St"
+)
+
+eastround1games <- modelgames |> 
+  group_by(team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("opponent")) |> 
+  right_join(eastround1games)
+
+eastround1games <- modelgames |> 
+  group_by(opponent_team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("team"), -game_id, -game_date, -season) |> 
+  right_join(eastround1games) 
+
+eastround1 <- rf_fit |> predict(new_data = eastround1games) |>
+  bind_cols(eastround1games) |> select(.pred_class, team_short_display_name, opponent_team_short_display_name, everything())
+
+eastround1 <- rf_fit |> predict(new_data = eastround1games, type="prob") |>
+  bind_cols(eastround1) |> select(.pred_class, .pred_W, .pred_L, team_short_display_name, opponent_team_short_display_name, everything())
+
+eastround2games <- tibble(
+  team_short_display_name="UConn",
+  opponent_team_short_display_name="FAU"
+) |> add_row(
+  team_short_display_name="San Diego St",
+  opponent_team_short_display_name="Auburn"
+) |> add_row(
+  team_short_display_name="BYU",
+  opponent_team_short_display_name="Morehead St"
+) |> add_row(
+  team_short_display_name="Drake",
+  opponent_team_short_display_name="S Dakota St")
+
+eastround2games <- modelgames |> 
+  group_by(team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("opponent")) |> 
+  right_join(eastround2games)
+
+eastround2games <- modelgames |> 
+  group_by(opponent_team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("team"), -game_id, -game_date, -season) |> 
+  right_join(eastround2games) 
+
+eastround2 <- rf_fit |> predict(new_data = eastround2games) |>
+  bind_cols(eastround2games) |> select(.pred_class, team_short_display_name, opponent_team_short_display_name, everything())
+
+eastround2 <- rf_fit |> predict(new_data = eastround2games, type="prob") |>
+  bind_cols(eastround2) |> select(.pred_class, .pred_W, .pred_L, team_short_display_name, opponent_team_short_display_name, everything())
+
+eastround3games <- tibble(
+  team_short_display_name="UConn",
+  opponent_team_short_display_name="Auburn"
+) |> add_row(
+  team_short_display_name="BYU",
+  opponent_team_short_display_name="Drake"
+)
+
+eastround3games <- modelgames |> 
+  group_by(team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("opponent")) |> 
+  right_join(eastround3games)
+
+eastround3games <- modelgames |> 
+  group_by(opponent_team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("team"), -game_id, -game_date, -season) |> 
+  right_join(eastround3games) 
+
+eastround3 <- rf_fit |> predict(new_data = eastround3games) |>
+  bind_cols(eastround3games) |> select(.pred_class, team_short_display_name, opponent_team_short_display_name, everything())
+
+eastround3 <- rf_fit |> predict(new_data = eastround3games, type="prob") |>
+  bind_cols(eastround3) |> select(.pred_class, .pred_W, .pred_L, team_short_display_name, opponent_team_short_display_name, everything())
+
+eastround4games <- tibble(
+  team_short_display_name="UConn",
+  opponent_team_short_display_name="BYU"
+)
+
+eastround4games <- modelgames |> 
+  group_by(team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("opponent")) |> 
+  right_join(eastround4games)
+
+eastround4games <- modelgames |> 
+  group_by(opponent_team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("team"), -game_id, -game_date, -season) |> 
+  right_join(eastround4games) 
+
+eastround4 <- rf_fit |> predict(new_data = eastround4games) |>
+  bind_cols(eastround4games) |> select(.pred_class, team_short_display_name, opponent_team_short_display_name, everything())
+
+eastround4 <- rf_fit |> predict(new_data = eastround4games, type="prob") |>
+  bind_cols(eastround4) |> select(.pred_class, .pred_W, .pred_L, team_short_display_name, opponent_team_short_display_name, everything())
+
+westround1games <- tibble(
+  team_short_display_name="North Carolina",
+  opponent_team_short_display_name="Wagner"
+) |> add_row(
+  team_short_display_name="Mississippi St",
+  opponent_team_short_display_name="Michigan St"
+) |> add_row(
+  team_short_display_name="Saint Mary's",
+  opponent_team_short_display_name="Grand Canyon"
+) |> add_row(
+  team_short_display_name="Alabama",
+  opponent_team_short_display_name="Charleston"
+) |> add_row(
+  team_short_display_name="Clemson",
+  opponent_team_short_display_name="New Mexico"
+) |> add_row(
+  team_short_display_name="Baylor",
+  opponent_team_short_display_name="Colgate"
+) |> add_row(
+  team_short_display_name="Dayton",
+  opponent_team_short_display_name="Nevada"
+) |> add_row(
+  team_short_display_name="Arizona",
+  opponent_team_short_display_name="Long Beach St"
+)
+
+westround1games <- modelgames |> 
+  group_by(team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("opponent")) |> 
+  right_join(westround1games)
+
+westround1games <- modelgames |> 
+  group_by(opponent_team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("team"), -game_id, -game_date, -season) |> 
+  right_join(westround1games) 
+
+westround1 <- rf_fit |> predict(new_data = westround1games) |>
+  bind_cols(westround1games) |> select(.pred_class, team_short_display_name, opponent_team_short_display_name, everything())
+
+westround1 <- rf_fit |> predict(new_data = westround1games, type="prob") |>
+  bind_cols(westround1) |> select(.pred_class, .pred_W, .pred_L, team_short_display_name, opponent_team_short_display_name, everything())
+
+westround2games <- tibble(
+  team_short_display_name="North Carolina",
+  opponent_team_short_display_name="Michigan St"
+) |> add_row(
+  team_short_display_name="Grand Canyon",
+  opponent_team_short_display_name="Alabama"
+) |> add_row(
+  team_short_display_name="Clemson",
+  opponent_team_short_display_name="Colgate"
+) |> add_row(
+  team_short_display_name="Dayton",
+  opponent_team_short_display_name="Arizona")
+
+westround2games <- modelgames |> 
+  group_by(team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("opponent")) |> 
+  right_join(westround2games)
+
+westround2games <- modelgames |> 
+  group_by(opponent_team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("team"), -game_id, -game_date, -season) |> 
+  right_join(westround2games) 
+
+westround2 <- rf_fit |> predict(new_data = westround2games) |>
+  bind_cols(westround2games) |> select(.pred_class, team_short_display_name, opponent_team_short_display_name, everything())
+
+westround2 <- rf_fit |> predict(new_data = westround2games, type="prob") |>
+  bind_cols(westround2) |> select(.pred_class, .pred_W, .pred_L, team_short_display_name, opponent_team_short_display_name, everything())
+
+westround3games <- tibble(
+  team_short_display_name="Colgate",
+  opponent_team_short_display_name="Arizona"
+) |> add_row(
+  team_short_display_name="North Carolina",
+  opponent_team_short_display_name="Grand Canyon"
+)
+
+westround3games <- modelgames |> 
+  group_by(team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("opponent")) |> 
+  right_join(westround3games)
+
+westround3games <- modelgames |> 
+  group_by(opponent_team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("team"), -game_id, -game_date, -season) |> 
+  right_join(westround3games) 
+
+westround3 <- rf_fit |> predict(new_data = westround3games) |>
+  bind_cols(westround3games) |> select(.pred_class, team_short_display_name, opponent_team_short_display_name, everything())
+
+westround3 <- rf_fit |> predict(new_data = westround3games, type="prob") |>
+  bind_cols(westround3) |> select(.pred_class, .pred_W, .pred_L, team_short_display_name, opponent_team_short_display_name, everything())
+
+westround4games <- tibble(
+  team_short_display_name="North Carolina",
+  opponent_team_short_display_name="Arizona"
+)
+
+westround4games <- modelgames |> 
+  group_by(team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("opponent")) |> 
+  right_join(westround4games)
+
+westround4games <- modelgames |> 
+  group_by(opponent_team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("team"), -game_id, -game_date, -season) |> 
+  right_join(westround4games) 
+
+westround4 <- rf_fit |> predict(new_data = westround4games) |>
+  bind_cols(westround4games) |> select(.pred_class, team_short_display_name, opponent_team_short_display_name, everything())
+
+westround4 <- rf_fit |> predict(new_data = westround4games, type="prob") |>
+  bind_cols(westround4) |> select(.pred_class, .pred_W, .pred_L, team_short_display_name, opponent_team_short_display_name, everything())
+
+midwestround1games <- tibble(
+  team_short_display_name="Purdue",
+  opponent_team_short_display_name="Grambling"
+) |> add_row(
+  team_short_display_name="Utah State",
+  opponent_team_short_display_name="TCU"
+) |> add_row(
+  team_short_display_name="Gonzaga",
+  opponent_team_short_display_name="McNeese"
+) |> add_row(
+  team_short_display_name="Kansas",
+  opponent_team_short_display_name="Samford"
+) |> add_row(
+  team_short_display_name="South Carolina",
+  opponent_team_short_display_name="Oregon"
+) |> add_row(
+  team_short_display_name="Creighton",
+  opponent_team_short_display_name="Akron"
+) |> add_row(
+  team_short_display_name="Texas",
+  opponent_team_short_display_name="Colorado St"
+) |> add_row(
+  team_short_display_name="Tennessee",
+  opponent_team_short_display_name="Saint Peter's"
+)
+
+midwestround1games <- modelgames |> 
+  group_by(team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("opponent")) |> 
+  right_join(midwestround1games)
+
+midwestround1games <- modelgames |> 
+  group_by(opponent_team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("team"), -game_id, -game_date, -season) |> 
+  right_join(midwestround1games) 
+
+midwestround1 <- rf_fit |> predict(new_data = midwestround1games) |>
+  bind_cols(midwestround1games) |> select(.pred_class, team_short_display_name, opponent_team_short_display_name, everything())
+
+midwestround1 <- rf_fit |> predict(new_data = midwestround1games, type="prob") |>
+  bind_cols(midwestround1) |> select(.pred_class, .pred_W, .pred_L, team_short_display_name, opponent_team_short_display_name, everything())
+
+midwestround2games <- tibble(
+  team_short_display_name="Purdue",
+  opponent_team_short_display_name="Utah State"
+) |> add_row(
+  team_short_display_name="McNeese",
+  opponent_team_short_display_name="Kansas"
+) |> add_row(
+  team_short_display_name="South Carolina",
+  opponent_team_short_display_name="Creighton"
+) |> add_row(
+  team_short_display_name="Tennessee",
+  opponent_team_short_display_name="Texas")
+
+midwestround2games <- modelgames |> 
+  group_by(team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("opponent")) |> 
+  right_join(midwestround2games)
+
+midwestround2games <- modelgames |> 
+  group_by(opponent_team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("team"), -game_id, -game_date, -season) |> 
+  right_join(midwestround2games) 
+
+midwestround2 <- rf_fit |> predict(new_data = midwestround2games) |>
+  bind_cols(midwestround2games) |> select(.pred_class, team_short_display_name, opponent_team_short_display_name, everything())
+
+midwestround2 <- rf_fit |> predict(new_data = midwestround2games, type="prob") |>
+  bind_cols(midwestround2) |> select(.pred_class, .pred_W, .pred_L, team_short_display_name, opponent_team_short_display_name, everything())
+
+midwestround3games <- tibble(
+  team_short_display_name="McNeese",
+  opponent_team_short_display_name="Utah State"
+) |> add_row(
+  team_short_display_name="Creighton",
+  opponent_team_short_display_name="Texas"
+)
+
+midwestround3games <- modelgames |> 
+  group_by(team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("opponent")) |> 
+  right_join(midwestround3games)
+
+midwestround3games <- modelgames |> 
+  group_by(opponent_team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("team"), -game_id, -game_date, -season) |> 
+  right_join(midwestround3games) 
+
+midwestround3 <- rf_fit |> predict(new_data = midwestround3games) |>
+  bind_cols(midwestround3games) |> select(.pred_class, team_short_display_name, opponent_team_short_display_name, everything())
+
+midwestround3 <- rf_fit |> predict(new_data = midwestround3games, type="prob") |>
+  bind_cols(midwestround3) |> select(.pred_class, .pred_W, .pred_L, team_short_display_name, opponent_team_short_display_name, everything())
+
+midwestround4games <- tibble(
+  team_short_display_name="McNeese",
+  opponent_team_short_display_name="Creighton"
+)
+
+midwestround4games <- modelgames |> 
+  group_by(team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("opponent")) |> 
+  right_join(midwestround4games)
+
+midwestround4games <- modelgames |> 
+  group_by(opponent_team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("team"), -game_id, -game_date, -season) |> 
+  right_join(midwestround4games) 
+
+midwestround4 <- rf_fit |> predict(new_data = midwestround4games) |>
+  bind_cols(midwestround4games) |> select(.pred_class, team_short_display_name, opponent_team_short_display_name, everything())
+
+midwestround4 <- rf_fit |> predict(new_data = midwestround4games, type="prob") |>
+  bind_cols(midwestround4) |> select(.pred_class, .pred_W, .pred_L, team_short_display_name, opponent_team_short_display_name, everything())
+
+southround1games <- tibble(
+  team_short_display_name="Houston",
+  opponent_team_short_display_name="Longwood"
+) |> add_row(
+  team_short_display_name="Nebraska",
+  opponent_team_short_display_name="Texas A&M"
+) |> add_row(
+  team_short_display_name="Wisconsin",
+  opponent_team_short_display_name="James Madison"
+) |> add_row(
+  team_short_display_name="Duke",
+  opponent_team_short_display_name="Vermont"
+) |> add_row(
+  team_short_display_name="Texas Tech",
+  opponent_team_short_display_name="NC State"
+) |> add_row(
+  team_short_display_name="Kentucky",
+  opponent_team_short_display_name="Oakland"
+) |> add_row(
+  team_short_display_name="Florida",
+  opponent_team_short_display_name="Colorado"
+) |> add_row(
+  team_short_display_name="Marquette",
+  opponent_team_short_display_name="Western KY"
+)
+
+southround1games <- modelgames |> 
+  group_by(team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("opponent")) |> 
+  right_join(southround1games)
+
+southround1games <- modelgames |> 
+  group_by(opponent_team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("team"), -game_id, -game_date, -season) |> 
+  right_join(southround1games) 
+
+southround1 <- rf_fit |> predict(new_data = southround1games) |>
+  bind_cols(southround1games) |> select(.pred_class, team_short_display_name, opponent_team_short_display_name, everything())
+
+southround1 <- rf_fit |> predict(new_data = southround1games, type="prob") |>
+  bind_cols(southround1) |> select(.pred_class, .pred_W, .pred_L, team_short_display_name, opponent_team_short_display_name, everything())
+
+southround2games <- tibble(
+  team_short_display_name="Houston",
+  opponent_team_short_display_name="Nebraska"
+) |> add_row(
+  team_short_display_name="James Madison",
+  opponent_team_short_display_name="Vermont"
+) |> add_row(
+  team_short_display_name="NC State",
+  opponent_team_short_display_name="Oakland"
+) |> add_row(
+  team_short_display_name="Marquette",
+  opponent_team_short_display_name="Colorado")
+
+southround2games <- modelgames |> 
+  group_by(team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("opponent")) |> 
+  right_join(southround2games)
+
+southround2games <- modelgames |> 
+  group_by(opponent_team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("team"), -game_id, -game_date, -season) |> 
+  right_join(southround2games) 
+
+southround2 <- rf_fit |> predict(new_data = southround2games) |>
+  bind_cols(southround2games) |> select(.pred_class, team_short_display_name, opponent_team_short_display_name, everything())
+
+southround2 <- rf_fit |> predict(new_data = southround2games, type="prob") |>
+  bind_cols(southround2) |> select(.pred_class, .pred_W, .pred_L, team_short_display_name, opponent_team_short_display_name, everything())
+
+southround3games <- tibble(
+  team_short_display_name="Nebraska",
+  opponent_team_short_display_name="Vermont"
+) |> add_row(
+  team_short_display_name="NC State",
+  opponent_team_short_display_name="Colorado"
+)
+
+southround3games <- modelgames |> 
+  group_by(team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("opponent")) |> 
+  right_join(southround3games)
+
+southround3games <- modelgames |> 
+  group_by(opponent_team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("team"), -game_id, -game_date, -season) |> 
+  right_join(southround3games) 
+
+southround3 <- rf_fit |> predict(new_data = southround3games) |>
+  bind_cols(southround3games) |> select(.pred_class, team_short_display_name, opponent_team_short_display_name, everything())
+
+southround3 <- rf_fit |> predict(new_data = southround3games, type="prob") |>
+  bind_cols(southround3) |> select(.pred_class, .pred_W, .pred_L, team_short_display_name, opponent_team_short_display_name, everything())
+
+southround4games <- tibble(
+  team_short_display_name="Vermont",
+  opponent_team_short_display_name="Colorado"
+)
+
+southround4games <- modelgames |> 
+  group_by(team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("opponent")) |> 
+  right_join(southround4games)
+
+southround4games <- modelgames |> 
+  group_by(opponent_team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("team"), -game_id, -game_date, -season) |> 
+  right_join(southround4games) 
+
+southround4 <- rf_fit |> predict(new_data = southround4games) |>
+  bind_cols(southround4games) |> select(.pred_class, team_short_display_name, opponent_team_short_display_name, everything())
+
+southround4 <- rf_fit |> predict(new_data = southround4games, type="prob") |>
+  bind_cols(southround4) |> select(.pred_class, .pred_W, .pred_L, team_short_display_name, opponent_team_short_display_name, everything())
+
+finalfourgames <- tibble(
+  team_short_display_name="UConn",
+  opponent_team_short_display_name="North Carolina"
+) |> add_row(
+  team_short_display_name="Vermont",
+  opponent_team_short_display_name="McNeese"
+)
+
+finalfourgames <- modelgames |> 
+  group_by(team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("opponent")) |> 
+  right_join(finalfourgames)
+
+finalfourgames <- modelgames |> 
+  group_by(opponent_team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("team"), -game_id, -game_date, -season) |> 
+  right_join(finalfourgames) 
+
+finalfour <- rf_fit |> predict(new_data = finalfourgames) |>
+  bind_cols(finalfourgames) |> select(.pred_class, team_short_display_name, opponent_team_short_display_name, everything())
+
+finalfour <- rf_fit |> predict(new_data = finalfourgames, type="prob") |>
+  bind_cols(finalfour) |> select(.pred_class, .pred_W, .pred_L, team_short_display_name, opponent_team_short_display_name, everything())
+
+champgame <- tibble(
+  team_short_display_name="UConn",
+  opponent_team_short_display_name="Vermont"
+) 
+
+champgame <- modelgames |> 
+  group_by(team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("opponent")) |> 
+  right_join(champgame)
+
+champgame <- modelgames |> 
+  group_by(opponent_team_short_display_name) |> 
+  filter(game_date == max(game_date) & season == 2024) |> 
+  ungroup() |> 
+  select(-team_result, -starts_with("team"), -game_id, -game_date, -season) |> 
+  right_join(champgame) 
+
+natty <- rf_fit |> predict(new_data = champgame) |>
+  bind_cols(champgame) |> select(.pred_class, team_short_display_name, opponent_team_short_display_name, everything())
+
+natty <- rf_fit |> predict(new_data = champgame, type="prob") |>
+  bind_cols(natty) |> select(.pred_class, .pred_W, .pred_L, team_short_display_name, opponent_team_short_display_name, everything())
+```
+
+Firstly, I invested a lot in my predictors. Turnovers per possession seemed to be one of the most reliable predictors.In my line of thinking, how often a team turns the ball over in each of their possessions can be a strong indicator of how well they can score when they have the ball and avoid ruining the possession. You cannot score if you don't have the ball and as has been seen numerous times in college basketball, turnovers are serious momentum killers. Looking back at the season of each team, I accounted for their season totals and also for their previous games to ensure that only games that had been played were factored in. I trusted my predictors and now, I am learning that more could have been done.
+
+```{r}
+summary(game_recipe)  |> 
+  select(variable, role) |> 
+  filter(role != "ID") |>
+  gt() |>
+  tab_header(
+    title = "The Main Culprit: The Predictors",
+    subtitle = "Turnovers per possession and efficiency. It can't go wrong, right?"
+  ) |>  
+  tab_source_note(
+    source_note = md("**By:** Jay Mingo")
+  ) |> 
+  tab_style(
+    style = cell_text(color = "black", weight = "bold", align = "left"),
+    locations = cells_title("title")
+  ) |> 
+  tab_style(
+    style = cell_text(color = "black", align = "left"),
+    locations = cells_title("subtitle")
+  ) |>
+  tab_style(
+     locations = cells_column_labels(columns = everything()),
+     style = list(
+       cell_borders(sides = "bottom", weight = px(3)),
+       cell_text(weight = "bold", size=12)
+     )
+   ) |>
+  opt_row_striping() |> 
+  opt_table_lines("none")
+```
+
+With these predictors, I opted for the random forests model. Of my options, it yielded the most effectiveness. The model yielded about a 69% accuracy which was substantial enough for me to select it as my model of choice.
+
+I did not expect major success but after seeing my West bracket round one results, I began to drink an unreal amount of bracketology Kool-Aid.
+
+Here are the results:
+
+```{r}
+westround1 |> 
+  select(team_short_display_name, .pred_class, .pred_W, opponent_team_short_display_name) |>
+  gt() |> 
+  cols_label(
+    team_short_display_name = "Team",
+    .pred_class = "Prediction",
+    .pred_W = "Win Confidence",
+    opponent_team_short_display_name = "Opponent"
+  ) |>
+  tab_header(
+    title = "West Regional: Round 1",
+    subtitle = "Even with Colgate winning, it was believable."
+  ) |>  
+  tab_source_note(
+    source_note = md("**By:** Jay Mingo")
+  ) |> 
+  tab_style(
+    style = cell_text(color = "black", weight = "bold", align = "left"),
+    locations = cells_title("title")
+  ) |> 
+  tab_style(
+    style = cell_text(color = "black", align = "left"),
+    locations = cells_title("subtitle")
+  ) |>
+  tab_style(
+     locations = cells_column_labels(columns = everything()),
+     style = list(
+       cell_borders(sides = "bottom", weight = px(3)),
+       cell_text(weight = "bold", size=12)
+     )
+   ) |>
+  opt_row_striping() |> 
+  opt_table_lines("none") |>
+    fmt_percent(
+    columns = c(.pred_W),
+    decimals = 1
+  )
+```
+
+One incorrect pick thanks to my model. Colgate sneaking one away from Baylor, which was believable. Baylor's season wasn't much to write home about and an upset of the sort seemed plausible. Though not displayed above, my model originally picked Colgate, Clemson, and Saint Mary's to win and two of those three were correct. One miracle away from a perfect regional.
+
+```{r}
+eastround1 |> 
+  select(team_short_display_name, .pred_class, .pred_W, opponent_team_short_display_name) |>
+  gt() |> 
+  cols_label(
+    team_short_display_name = "Team",
+    .pred_class = "Prediction",
+    .pred_W = "Win Confidence",
+    opponent_team_short_display_name = "Opponent"
+  ) |>
+  tab_header(
+    title = "East Regional: Round 1",
+    subtitle = "It could have been worse."
+  ) |>  
+  tab_source_note(
+    source_note = md("**By:** Jay Mingo")
+  ) |> 
+  tab_style(
+    style = cell_text(color = "black", weight = "bold", align = "left"),
+    locations = cells_title("title")
+  ) |> 
+  tab_style(
+    style = cell_text(color = "black", align = "left"),
+    locations = cells_title("subtitle")
+  ) |>
+  tab_style(
+     locations = cells_column_labels(columns = everything()),
+     style = list(
+       cell_borders(sides = "bottom", weight = px(3)),
+       cell_text(weight = "bold", size=12)
+     )
+   ) |>
+  opt_row_striping() |> 
+  opt_table_lines("none") |>
+    fmt_percent(
+    columns = c(.pred_W),
+    decimals = 1
+  )
+```
+
+25%. 2-for-8. If I were playing baseball, .250 would be decent, maybe even impressive if it were later in the season. However, I am not a MLB player and this was not baseball. Instead, it was the most mind-boggling, puzzling, and gut-wrenching portion of a bracket that I've ever seen. Besides the upsets of Auburn, BYU, and FAU, the lunacy of my model to predict South Dakota State, Morehead State, and Drake to win was almost infuriating. To make matters worse, three lost by five points or less, one hung around up until halftime, and the other could've won if they'd not blown in to end regulation, but I digress.
+
+The best thing to come from the East Regional was predicting UConn all the way to a back-to-back national title, even if it was against the Catamounts of Vermont. Somehow, my worst regional gave me the evventual winner, but the path there was anything but great.
+
+If a Final Four ends up with UConn, Alabama, Vermont, and McNeese, perhaps that is something to question. Even with this motley crew of teams that my model predicted, I finished with 910 points and in the top 71.6% of all brackets. There's a lot I wish that I could go back and do over, things I'd change, but it could've been worse.
+
+I mean, finishing in the top 71.6% of many million brackets. That's got to count for something, right?
+
+Who doesn't love a finish in the top 7.6 million?
